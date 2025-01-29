@@ -1,0 +1,92 @@
+import boto3
+import json
+from flask import Flask, jsonify
+import dash
+import dash_core_components as dcc
+import dash_html_components as html
+from dash.dependencies import Input, Output
+import plotly.express as px
+
+app = Flask(__name__)
+dashboard = dash.Dash(__name__, server=app, routes_pathname_prefix='/dashboard/')
+
+# AWS Clients--
+
+aws_services = ['ec2', 's3', 'iam', 'rds']
+clients = {service: boto3.client(service) for service in aws_services}
+
+def scan_s3_buckets():
+    """Scan S3 bucket policies for misconfigurations."""
+    issues = []
+    s3 = clients['s3']
+    for bucket in s3.list_buckets()['Buckets']:
+        bucket_name = bucket['Name']
+        try:
+            policy = s3.get_bucket_policy(Bucket=bucket_name)
+            if 'Allow' in policy['Policy']:
+                issues.append({'bucket': bucket_name, 'issue': 'Overly permissive policy'})
+        except Exception:
+            pass
+    return issues   
+
+def scan_iam_users():
+    """Check IAM users for security risks."""
+    issues = []
+    iam = clients['iam']
+    users = iam.list_users()
+    for user in users['Users']:
+        access_keys = iam.list_access_keys(UserName=user['UserName'])
+        for key in access_keys['AccessKeyMetadata']:
+            if key['Status'] == 'Active':
+                issues.append({'user': user['UserName'], 'issue': 'Active access key'})
+    return issues
+
+
+def scan_security_groups():
+    """Check EC2 security groups for open ports."""
+    issues = []
+    ec2 = clients['ec2']
+    for sg in ec2.describe_security_groups()['SecurityGroups']:
+        for rule in sg['IpPermissions']:
+            if rule.get('IpRanges'):
+                for ip in rule['IpRanges']:
+                    if ip['CidrIp'] == '0.0.0.0/0':
+                        issues.append({'security_group': sg['GroupId'], 'issue': 'Open to all'})
+    return issues
+
+
+@app.route('/scan', methods=['GET'])
+def scan_aws():
+    """Run all AWS security scans."""
+    results = {
+        's3': scan_s3_buckets(),
+        'iam': scan_iam_users(),
+        'ec2': scan_security_groups()
+    }
+    return jsonify(results)
+
+def create_dashboard():
+    """Create an interactive security dashboard."""
+    dashboard.layout = html.Div([
+        html.H1("AWS Security Monitoring Dashboard"),
+        dcc.Dropdown(
+            id='service-dropdown',
+            options=[{'label': service.upper(), 'value': service} for service in aws_services],
+            value='s3'
+        ),
+        dcc.Graph(id='security-graph')
+    ])
+
+    @dashboard.callback(
+        Output('security-graph', 'figure'),
+        [Input('service-dropdown', 'value')]
+    )
+    def update_graph(selected_service):
+        data = scan_aws().json[selected_service]
+        df = [{'Resource': d['bucket'] if 'bucket' in d else d.get('security_group', d.get('user', 'Unknown')), 'Issue': d['issue']} for d in data]
+        fig = px.bar(df, x='Resource', y='Issue', title=f"{selected_service.upper()} Security Issues")
+        return fig
+
+if __name__ == '__main__':
+    create_dashboard()
+    app.run(debug=True, port=5000)
